@@ -20,6 +20,8 @@ Cambios de esta versión:
     fantasma a 2x y 3x de la distancia real), PROFILE_2, threshold_sensitivity = 0.7,
     start_m = 0.03 (límite con cancelación de fuga) y update_rate = 20.
     CLOSE_RANGE = False pasa a modo robusto: sin cancelación de fuga, start_m = 0.07.
+  - Pico W: si USAR_PICO = True, un hilo aparte (pico_receptor.py) recibe la IMU de la
+    Pico por el puerto 5006 y la guarda en su propio CSV (pico_*.csv) junto al de acá.
 """
 
 import time
@@ -44,6 +46,8 @@ from adafruit_bno08x import (
     BNO_REPORT_ROTATION_VECTOR,
 )
 
+from pico_receptor import ReceptorPico
+
 from acconeer.exptool import a121
 from acconeer.exptool.a121.algo.distance import (
     Detector,
@@ -55,6 +59,7 @@ from acconeer.exptool.a121.algo.distance import (
 
 HOST = "0.0.0.0"   # escucha en todas las interfaces
 PORT = 5005         # elegí el puerto que quieras, y abrilo en el firewall si hace falta
+USAR_PICO = True    # recibir la IMU de la Pico W (puerto 5006, ver pico_receptor.py)
 
 # --- IMU: validación y recuperación automática ---
 IMU_RESET_PIN = None    # p. ej. board.D17 si conectás el pin RST del BNO085 a ese GPIO
@@ -329,6 +334,11 @@ def main():
     client, detector, contexto_radar = init_radar(contexto_guardado=contexto_radar)
     csv_file, csv_writer = abrir_csv()
 
+    receptor_pico = None
+    if USAR_PICO:
+        receptor_pico = ReceptorPico()
+        receptor_pico.start()
+
     # Socket TCP: esperamos a que la PC se conecte
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -457,11 +467,15 @@ def main():
         sys.stdout.write(f"\rMuestras: {contador}  |  Dist: "
                           f"{f'{dist_m*100:.1f}cm' if dist_m else '------'}  |  "
                           f"Roll:{roll:6.1f} Pitch:{pitch:6.1f} Yaw:{yaw:6.1f}  |  "
-                          f"IMU:{'ok' if imu['ok'] else 'X '}")
+                          f"IMU:{'ok' if imu['ok'] else 'X '}"
+                          + (f"  |  Pico:{receptor_pico.estado()}" if receptor_pico else ""))
         sys.stdout.flush()
 
     print(f"\n\nFinalizado. Muestras: {contador}")
     print(f"Reinicios de IMU: {imu_dev.reinicios}  |  Reconexiones de radar: {reconexiones_radar}")
+    if receptor_pico:
+        receptor_pico.detener()
+        print(receptor_pico.resumen())
     csv_file.flush()
     csv_file.close()
     try:
