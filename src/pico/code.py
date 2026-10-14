@@ -1,18 +1,4 @@
-# Corre en la Raspberry Pi Pico W con CircuitPython. Se llama code.py para que arranque
-# sola al alimentarla. Copiar al disco CIRCUITPY: code.py, config.py, imu_pico.py y, en
-# lib/, adafruit_bno08x y adafruit_bus_device (circup install adafruit_bno08x).
-#
-# Lee la IMU a FRECUENCIA_HZ y manda cada muestra a la Zero (pico_receptor.py) por TCP,
-# una línea JSON por muestra:
-#   - las muestras quedan en un buffer (BUFFER_MAX) hasta que la Zero confirma que las
-#     guardó ("ack <seq>"). Si la conexión se corta, al reconectar se reenvía todo lo no
-#     confirmado; la Zero descarta los repetidos. Si el corte dura más de lo que entra en
-#     el buffer, se descartan las más viejas (la Zero lo ve como huecos en seq).
-#   - el socket se reintenta cada REINTENTO_MS sin frenar el muestreo; la WiFi en cambio
-#     sí lo frena mientras intenta conectarse (ver WIFI_TIMEOUT_S en config.py).
-# Cada muestra lleva seq (para detectar pérdidas y descartar reenvíos) y t_pico_ms (ms desde
-# el arranque, para que la Zero la ubique en su reloj).
-#
+# Corre en la Raspberry Pi Pico W con CircuitPython. 
 # LED de la placa: apagado = sin WiFi, parpadeo = WiFi sin conexión a la Zero,
 # fijo = mandando datos.
 
@@ -31,10 +17,10 @@ import wifi
 import config
 from imu_pico import crear_imu, ms
 
-REINTENTO_MS = 2000       # cada cuánto reintentar el socket si hay WiFi pero no Zero
-TIMEOUT_SOCKET_S = 0.5    # máximo que una escritura puede frenar el muestreo
+REINTENTO_MS = 2000       
+TIMEOUT_SOCKET_S = 0.5    
 MAX_LINEAS_POR_ENVIO = 40
-ESTADO_MS = 5000          # cada cuánto imprimir estado por USB
+ESTADO_MS = 5000          
 SIN_DATOS = (errno.EAGAIN, errno.ETIMEDOUT)
 
 
@@ -52,11 +38,9 @@ class Enlace:
         self.enviadas = 0   # cuántas de las pendientes ya salieron por esta conexión
         self.conexiones = 0
         try:
-            # Sin ahorro de energía: con el modo por defecto la Pico W agrupa los envíos
-            # y aparecen demoras de cientos de ms.
             wifi.radio.power_management = wifi.PowerManagement.NONE
         except Exception:
-            pass  # versiones de CircuitPython que no lo tienen
+            pass  
 
     def wifi_ok(self):
         return wifi.radio.ipv4_address is not None
@@ -77,7 +61,7 @@ class Enlace:
         return True
 
     def mantener(self, wdt=None):
-        """Reintenta WiFi y socket. True si hay socket."""
+        
         if self.sock is not None:
             return True
         if not self.wifi_ok() and not self._conectar_wifi(wdt):
@@ -93,8 +77,6 @@ class Enlace:
             s.settimeout(TIMEOUT_SOCKET_S * 4)
             s.connect((config.MASTER_IP, config.MASTER_PORT))
             s.settimeout(TIMEOUT_SOCKET_S)
-            # El hola lleva el reloj actual: le da a la Zero una referencia fresca para
-            # ubicar las muestras que se acumularon mientras no había conexión.
             self.hola["t_pico_ms"] = ms()
             self._escribir(s, (json.dumps(self.hola) + "\n").encode())
         except OSError as e:
@@ -111,7 +93,6 @@ class Enlace:
 
     @staticmethod
     def _escribir(s, datos):
-        # send() puede mandar solo una parte: se insiste hasta mandar todo o hasta timeout.
         mv = memoryview(datos)
         while len(mv):
             n = s.send(mv)
@@ -120,7 +101,6 @@ class Enlace:
             mv = mv[n:]
 
     def enviar(self, pendientes):
-        """Manda hasta MAX_LINEAS_POR_ENVIO de las pendientes que todavía no salieron."""
         lote = pendientes[self.enviadas:self.enviadas + MAX_LINEAS_POR_ENVIO]
         if not lote:
             return
@@ -128,8 +108,6 @@ class Enlace:
             self._escribir(self.sock, b"".join(linea for _, linea in lote))
             self.enviadas += len(lote)
         except OSError as e:
-            # Si la escritura quedó a medias, la Zero descarta la línea cortada y las
-            # repetidas (por seq), así que al reconectar se reenvía todo lo no confirmado.
             print("Conexión perdida con la Zero:", e)
             self.cerrar()
 
@@ -194,20 +172,20 @@ def main():
     proximo = ms()
     t_estado = proximo
     seq = 0
-    pendientes = []    # (seq, línea) no confirmadas por la Zero
+    pendientes = []   
     descartadas = 0
-    lazo_max = 0       # ms del lazo más lento desde el último estado (si > periodo, no da)
-
+    lazo_max = 0      
+    
     while True:
         espera = proximo - ms()
         if espera > 0:
             time.sleep(espera / 1000)
         elif espera < -5 * periodo:
-            proximo = ms()  # nos atrasamos mucho: no intentar recuperar de golpe
+            proximo = ms()  
         proximo += periodo
         t_lazo = ms()
 
-        # --- Muestra ---
+        # Muestra
         d = imu.leer()
         d["seq"] = seq
         d["t_pico_ms"] = t_lazo
@@ -219,7 +197,7 @@ def main():
             if enlace.enviadas:
                 enlace.enviadas -= 1
 
-        # --- Red ---
+        # Red
         if enlace.mantener(wdt):
             ack = enlace.leer_ack()
             if ack is not None:
@@ -242,7 +220,7 @@ def main():
         if wdt is not None:
             wdt.feed()
         if seq % 20 == 0:
-            gc.collect()  # GC chico y frecuente en vez de uno largo en un momento cualquiera
+            gc.collect()  
 
         lazo_max = max(lazo_max, ms() - t_lazo)
         if ms() - t_estado >= ESTADO_MS:
@@ -259,7 +237,6 @@ try:
 except KeyboardInterrupt:
     print("Detenido")
 except Exception as e:
-    # Sin nadie mirando (en la caminata), mejor reiniciar que quedar muerta.
     try:
         import traceback
         traceback.print_exception(e)
