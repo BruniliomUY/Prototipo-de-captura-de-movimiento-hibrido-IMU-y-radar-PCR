@@ -19,10 +19,6 @@ Para llevar cada muestra al reloj del master se usa
 y el mínimo de offset en una ventana deslizante: la muestra que llegó más rápido es la que
 mejor representa la diferencia de relojes (las demás están infladas por demoras de WiFi
 o por haber quedado en el buffer de la Pico). ts_master_est = t_pico + min(offset).
-El "hola" trae el reloj de la Pico en el momento de conectar, así que las muestras que
-quedaron en el buffer mientras no había WiFi ya se ubican bien.
-La ventana deslizante absorbe la deriva del cristal de la Pico. Se guardan también
-t_recepcion y t_pico_ms crudos para poder rehacer la sincronización al analizar.
 """
 
 import csv
@@ -37,10 +33,10 @@ from datetime import datetime
 
 PICO_HOST = "0.0.0.0"
 PICO_PORT = 5006
-VENTANA_SYNC = 400          # muestras para estimar el offset de reloj (~20 s a 20 Hz)
-TIMEOUT_SIN_DATOS_S = 5.0   # sin datos este tiempo => se da la conexión por muerta
-                            # (si la Pico se queda sin batería el TCP no se cierra solo)
-ACK_S = 0.25                # cada cuánto confirmarle a la Pico lo recibido
+VENTANA_SYNC = 400          # (~20 s a 20 Hz)
+TIMEOUT_SIN_DATOS_S = 5.0   
+                            
+ACK_S = 0.25                
 
 COLUMNAS = [
     "ts_master_est", "t_recepcion", "t_pico_ms", "seq", "boot_id",
@@ -58,18 +54,18 @@ class ReceptorPico(threading.Thread):
 
         self.conectada = False
         self.muestras = 0
-        self.perdidas = 0       # huecos en seq (la Pico descartó por buffer lleno, o se perdieron)
-        self.duplicadas = 0     # reenvíos tras reconexión (se descartan)
-        self.invalidas = 0      # líneas que no son JSON (cortadas en una desconexión)
+        self.perdidas = 0       
+        self.duplicadas = 0     # (se descartan)
+        self.invalidas = 0      
         self.conexiones = 0
-        self.ultima = None      # última muestra recibida (dict)
+        self.ultima = None      
 
         self.boot_id = None
         self.imu_tipo = ""
         self.ultimo_seq = -1
         self.offsets = deque(maxlen=VENTANA_SYNC)
 
-    # ---------------------------------------------------------------
+   
     def detener(self):
         self._detener.set()
         self.join(timeout=3.0)
@@ -85,7 +81,7 @@ class ReceptorPico(threading.Thread):
                 f"duplicadas {self.duplicadas} | líneas inválidas {self.invalidas} | "
                 f"conexiones {self.conexiones}")
 
-    # ---------------------------------------------------------------
+   
     def run(self):
         nombre = f"{self.prefijo_csv}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
         f = open(nombre, "w", newline="")
@@ -111,8 +107,7 @@ class ReceptorPico(threading.Thread):
                 entradas = [srv] if conn is None else [srv, conn]
                 listos, _, _ = select.select(entradas, [], [], 0.5)
 
-                # Conexión nueva. Si ya había una, gana la nueva: lo normal es que la Pico
-                # se haya reiniciado y la vieja haya quedado colgada.
+                # Conexión nueva. Si ya había una, gana la nueva
                 if srv in listos:
                     nueva, addr = srv.accept()
                     if conn is not None:
@@ -228,7 +223,7 @@ class ReceptorPico(threading.Thread):
         ]
 
 
-# -----------------------------------------------------------
+
 if __name__ == "__main__":
     receptor = ReceptorPico()
     receptor.start()
