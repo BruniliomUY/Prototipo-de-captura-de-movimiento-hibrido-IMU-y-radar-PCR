@@ -4,24 +4,11 @@ Corre en la Raspberry Pi.
 Lee IMU (BNO085) + Radar (Acconeer XM125), guarda CSV local como respaldo,
 y transmite cada muestra por TCP (JSON, una línea por muestra) a quien se conecte.
 
-No requiere matplotlib ni entorno gráfico en el Pi.
-
 I2C del BNO085: usa clock stretching y la Pi lo maneja mal (KeyError / OSError al
 leer). La velocidad real del bus se fija en /boot/firmware/config.txt (antes de
 Bookworm: /boot/config.txt), no desde Python (Blinka ignora el parámetro frequency):
     dtparam=i2c_arm_baudrate=400000
 y hay que reiniciar la Pi para que tome efecto.
-
-Cambios de esta versión:
-  - IMU: IMU_ERRORES_MAX = 3 y IMU_CONGELADO_S = 5.0 (menos falsos positivos con el
-    sensor quieto). Al final se imprime cuántos reinicios de IMU y reconexiones de
-    radar hubo, y la línea de estado muestra si la IMU está ok.
-  - Radar: peaksorting_method = CLOSEST (con aluminio, STRONGEST devolvía ecos
-    fantasma a 2x y 3x de la distancia real), PROFILE_2, threshold_sensitivity = 0.7,
-    start_m = 0.03 (límite con cancelación de fuga) y update_rate = 20.
-    CLOSE_RANGE = False pasa a modo robusto: sin cancelación de fuga, start_m = 0.07.
-  - Pico W: si USAR_PICO = True, un hilo aparte (pico_receptor.py) recibe la IMU de la
-    Pico por el puerto 5006 y la guarda en su propio CSV (pico_*.csv) junto al de acá.
 """
 
 import time
@@ -57,25 +44,19 @@ from acconeer.exptool.a121.algo.distance import (
     ThresholdMethod,
 )
 
-HOST = "0.0.0.0"   # escucha en todas las interfaces
-PORT = 5005         # elegí el puerto que quieras, y abrilo en el firewall si hace falta
-USAR_PICO = True    # recibir la IMU de la Pico W (puerto 5006, ver pico_receptor.py)
+HOST = "0.0.0.0"   
+PORT = 5005         
+USAR_PICO = True    
 
 # --- IMU: validación y recuperación automática ---
-IMU_RESET_PIN = None    # p. ej. board.D17 si conectás el pin RST del BNO085 a ese GPIO
-IMU_NORMA_TOL = 0.02    # tolerancia de |q| respecto de 1 (cuaternión válido)
-IMU_ERRORES_MAX = 3     # errores seguidos (que no sean OSError) antes de reiniciar el IMU
-IMU_CONGELADO_S = 5.0   # accel + cuaternión idénticos durante este tiempo => IMU congelado
-                        # (con 2 s un sensor muy quieto puede dar falsos reinicios; validar
-                        #  con la prueba de 2 minutos quieto: los reinicios deben ser 0)
+IMU_RESET_PIN = None    
+IMU_NORMA_TOL = 0.02   
+IMU_ERRORES_MAX = 3     
+IMU_CONGELADO_S = 5.0   
+                        
 
 # --- Radar: configuración del detector de distancia ---
-# CLOSE_RANGE = True : mide desde ~3 cm (límite de Acconeer con cancelación de fuga), pero
-#   - la calibración (que se repite en cada reconexión del radar) necesita espacio
-#     libre frente al sensor, ya montado en su geometría final;
-#   - cada reconexión puede tardar ~30 s a 115200 (ver el print del arranque).
-# CLOSE_RANGE = False: sin cancelación de fuga; mide desde ~7 cm, la reconexión tarda ~3 s
-#   y no exige frente libre al calibrar.
+
 CLOSE_RANGE = True
 
 CLOSE_RANGE = True
@@ -97,13 +78,11 @@ RADAR_CONFIG = dict(
     update_rate=20.0,
 )
 
-# UART del radar. Con close range, calibrate_detector() graba num_frames_in_recorded_threshold
-# frames completos (~3.5 KB c/u => ~100 KB con 30 frames): un solo byte corrupto la aborta.
-RADAR_BAUDRATE = 115200       # None = el cliente usa el max_baudrate del servidor (o 115200); 115200 fuerza la base
-RADAR_FLOW_CONTROL = True   # RTS/CTS por hardware; probá False si solo tenés TX/RX/GND cableados
+RADAR_BAUDRATE = 115200       
+RADAR_FLOW_CONTROL = True   
 
 
-# -----------------------------------------------------------
+
 class DummyFile(object):
     def write(self, x): pass
     def flush(self): pass
@@ -127,7 +106,7 @@ def quat_to_euler(qi, qj, qk, qr):
     return roll, pitch, yaw
 
 
-# -----------------------------------------------------------
+
 def crear_reset_imu():
     """Devuelve el pin de reset del BNO085 (o None si no está conectado)."""
     if IMU_RESET_PIN is None:
@@ -143,7 +122,7 @@ def init_imu(reset=None, retries=3):
         try:
             print("Iniciando IMU BNO085 por I2C...")
             with SilenciarSalida():
-                # La velocidad real del bus la fija config.txt (ver docstring).
+                
                 i2c = busio.I2C(board.SCL, board.SDA)
                 time.sleep(0.5)
                 bno = BNO08X_I2C(i2c, reset=reset)
@@ -165,16 +144,6 @@ def init_imu(reset=None, retries=3):
 
 
 class Imu:
-    """
-    Envuelve el BNO085:
-      - descarta cuaterniones corruptos (|q| lejos de 1),
-      - reinicia el sensor si el bus falla (OSError), si hay errores seguidos
-        o si deja de mandar datos nuevos (congelado),
-      - ante un error NO devuelve ceros: repite el último valor válido con ok=False.
-
-    Nota para el análisis: los IMU_CONGELADO_S segundos previos a cada detección de
-    congelamiento quedan registrados con imu_ok=1; descartarlos al procesar el CSV.
-    """
 
     def __init__(self, reset=None):
         self.reset = reset
@@ -187,8 +156,7 @@ class Imu:
         self.reinicios = 0
 
     def _muestra_invalida(self):
-        # Para marcar con NaN en vez de repetir el último valor, devolver
-        # (nan, nan, nan) acá (ojo: el JSON de Python escribe NaN, que no es JSON estricto).
+        
         return dict(accel=self.ultimo_accel, euler=self.ultimo_euler, ok=False)
 
     def reiniciar(self, motivo):
@@ -200,10 +168,10 @@ class Imu:
             pass
         try:
             self.bno, self.i2c = init_imu(self.reset)
-            time.sleep(0.5)  # dejar que lleguen los primeros reportes
+            time.sleep(0.5)  
         except Exception as e:
             print(f"[IMU] Falló el reinicio: {e}", file=sys.stderr)
-            time.sleep(2.0)  # evitar reintentar en loop cerrado si sigue fallando
+            time.sleep(2.0)  
         self.errores_seguidos = 0
         self.firma = None
         self.t_cambio = time.time()
@@ -213,8 +181,6 @@ class Imu:
             with SilenciarSalida():
                 accel = tuple(self.bno.acceleration)
                 q = tuple(self.bno.quaternion)  # (i, j, k, real)
-            # La librería a veces deja pasar paquetes corruptos sin excepción
-            # (por ejemplo Pitch = 90.0 exacto): un cuaternión válido tiene |q| = 1.
             norma = sum(c * c for c in q) ** 0.5
             if not abs(norma - 1.0) <= IMU_NORMA_TOL:
                 raise ValueError(f"cuaternión inválido (|q|={norma:.3f})")
@@ -222,8 +188,7 @@ class Imu:
         except Exception as e:
             self.errores_seguidos += 1
             print(f"\n[IMU ERROR] {type(e).__name__}: {e}", file=sys.stderr)
-            # OSError = el sensor dejó de contestar en el bus: reinicio inmediato.
-            # Otros errores (paquete corrupto) suelen recuperarse solos; si se repiten, reinicio.
+            
             if isinstance(e, OSError):
                 self.reiniciar("OSError")
             elif self.errores_seguidos >= IMU_ERRORES_MAX:
@@ -233,9 +198,7 @@ class Imu:
         self.errores_seguidos = 0
         self.ultimo_accel, self.ultimo_euler = accel, euler
 
-        # IMU congelado: el sensor dejó de mandar reportes y la librería sigue
-        # devolviendo el último valor guardado. Con ruido real del acelerómetro,
-        # que accel + cuaternión sean idénticos durante segundos no es normal.
+
         firma = (accel, q)
         ahora = time.time()
         if firma != self.firma:
@@ -309,8 +272,7 @@ def leer_radar(detector):
         if "No messages to consume" in str(e):
             return dict(distancia_m=None, ok=True, desconectado=False)
         
-        # ¡Cualquier otro error (como UnicodeDecodeError) rompe la sincronización!
-        # Marcamos 'desconectado=True' para obligar a que se reinicie el sensor.
+
         print(f"\n[RADAR ERROR] {type(e).__name__}: {e}", file=sys.stderr)
         return dict(distancia_m=None, ok=False, desconectado=True)
 
@@ -326,7 +288,7 @@ def abrir_csv():
     return f, writer
 
 
-# -----------------------------------------------------------
+
 def main():
     imu_dev = Imu(crear_reset_imu())
     time.sleep(1.0)
@@ -339,7 +301,7 @@ def main():
         receptor_pico = ReceptorPico()
         receptor_pico.start()
 
-    # Socket TCP: esperamos a que la PC se conecte
+    # Socket TCP: espera q PC se conecte
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind((HOST, PORT))
@@ -360,13 +322,13 @@ def main():
     signal.signal(signal.SIGINT, salir)
     signal.signal(signal.SIGTERM, salir)
 
-    srv.setblocking(False)  # accept() no bloqueante: nunca frena el loop de muestreo
+    srv.setblocking(False)  
 
     contador = 0
     reconexiones_radar = 0
 
     while running:
-        # Aceptar conexión si todavía no hay una (retorna al instante si no hay nadie)
+        # Aceptar conexión si todavía no hay una 
         if conn is None:
             try:
                 conn, addr = srv.accept()
@@ -384,14 +346,12 @@ def main():
         radar = leer_radar(detector)
         t_c = time.perf_counter()
 
-# PROTECCIÓN ANTI-IMU: Si la IMU tardó más de 1.5 segundos (porque se reinició),
-        # es 100% seguro que el buffer UART del radar se llenó de basura y perdió sincronía.
-        # Forzamos una reconexión preventiva del radar.
+
         if (t_b - t_a) > 1.5:
             print("\n[SISTEMA] IMU bloqueó el bucle por >1.5s. Limpiando y reiniciando radar...", file=sys.stderr)
             radar["desconectado"] = True
 
-        # Bloque de reconexión corregido (sin la variable vieja de calibracion_guardada)
+      
         if radar["desconectado"]:
             print("\n[RADAR] Reconectando...", file=sys.stderr)
             reconexiones_radar += 1
@@ -414,7 +374,6 @@ def main():
         roll, pitch, yaw = imu["euler"]
         dist_m = radar["distancia_m"]
 
-        # Un solo diccionario, usado tanto para el JSON por TCP como para la fila del CSV.
         muestra = dict(
             timestamp=ts,
             accel_x=ax, accel_y=ay, accel_z=az,
@@ -439,7 +398,7 @@ def main():
 
         t_d = time.perf_counter()
 
-        # Respaldo local siempre, haya o no PC conectada
+        # Respaldo local 
         csv_writer.writerow([
             f"{muestra['timestamp']:.4f}",
             f"{muestra['accel_x']:.4f}", f"{muestra['accel_y']:.4f}", f"{muestra['accel_z']:.4f}",
