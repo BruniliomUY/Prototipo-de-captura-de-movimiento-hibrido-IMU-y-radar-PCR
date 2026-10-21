@@ -766,13 +766,22 @@ def sesion(ctl, receptor, live, resp_on):
                 roll, pitch, yaw = imu["euler"]
                 dist_m = radar["distancia_m"]
 
-                # Un solo diccionario, usado tanto para el JSON por TCP como para la fila del CSV.
+                pico_roll, pico_pitch, pico_yaw = 0.0, 0.0, 0.0
+                if receptor is not None and receptor.ultima is not None:
+                    pico_roll = receptor.ultima.get("roll", 0.0)
+                    pico_pitch = receptor.ultima.get("pitch", 0.0)
+                    pico_yaw = receptor.ultima.get("yaw", 0.0)
+
                 muestra = dict(
                     timestamp=ts,
                     accel_x=ax, accel_y=ay, accel_z=az,
                     roll=roll, pitch=pitch, yaw=yaw,
                     distancia_m=dist_m,
                     imu_ok=imu["ok"], radar_ok=radar["ok"],
+                    # --- NUEVO: Enviar datos de la Pico a la PC ---
+                    pico_roll=pico_roll,
+                    pico_pitch=pico_pitch,
+                    pico_yaw=pico_yaw
                 )
 
                 t_d = t_e = t_c
