@@ -865,6 +865,15 @@ def sesion(ctl, receptor, live, resp_on):
         ruta, n_filas, con_pico = unir_csv(sid, t0)
         ctl.ultimo_csv = ruta
         resumen = (f"sid={sid} duracion={t_off - t0:.1f}s filas_master={n_filas}")
+        try:
+            os.remove(f"datos_{sid}.csv")
+            if os.path.exists(f"pico_{sid}.csv"):
+                os.remove(f"pico_{sid}.csv")
+        except Exception:
+            pass
+        # ---------------------------------------------------------------
+        
+        resumen = (f"sid={sid} duracion={t_off - t0:.1f}s filas_master={n_filas}")
         if receptor is not None:
             resumen += (f" filas_con_pico={con_pico} pico_muestras={info_pico['muestras']}"
                         f" pico_perdidas={info_pico['perdidas']}")
