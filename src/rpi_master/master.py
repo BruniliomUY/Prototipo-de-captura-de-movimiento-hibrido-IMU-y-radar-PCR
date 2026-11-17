@@ -109,15 +109,15 @@ IMU_CONGELADO_S = 5.0   # accel + cuaternión idénticos durante este tiempo => 
 #   - cada reconexión puede tardar ~30 s a 115200 (ver el print del arranque).
 # CLOSE_RANGE = False: sin cancelación de fuga; mide desde ~7 cm, la reconexión tarda ~3 s
 #   y no exige frente libre al calibrar.
-CLOSE_RANGE = True
+CLOSE_RANGE = False
 
 RADAR_CONFIG = dict(
     start_m=0.03 if CLOSE_RANGE else 0.07,
-    end_m=0.65,
+    end_m=0.35,
     max_step_length=2,
     max_profile=a121.Profile.PROFILE_2,
     close_range_leakage_cancellation=CLOSE_RANGE,
-    signal_quality=20.0,
+    signal_quality=30.0,
     threshold_method=ThresholdMethod.CFAR,
     peaksorting_method=PeakSortingMethod.CLOSEST,
     reflector_shape=ReflectorShape.GENERIC,
@@ -125,7 +125,7 @@ RADAR_CONFIG = dict(
     fixed_threshold_value=100.0,
     fixed_strength_threshold_value=0.0,
     threshold_sensitivity=0.7,
-    update_rate=20.0,
+    update_rate=20.0,     # ~15 % por debajo de lo que deja pasar el UART a 115200 (~9,4 Hz sin close range)
 )
 
 # UART del radar. Con close range, calibrate_detector() graba num_frames_in_recorded_threshold
@@ -133,6 +133,14 @@ RADAR_CONFIG = dict(
 RADAR_PUERTO_SERIE = "/dev/serial0"
 RADAR_BAUDRATE = 115200     # None = el cliente usa el max_baudrate del servidor (o 115200); 115200 fuerza la base
 RADAR_FLOW_CONTROL = True   # RTS/CTS por hardware; probá False si solo tenés TX/RX/GND cableados
+
+# --- Radar: guardar TODO lo que entrega (CRUDO) ---
+# True = además del CSV, se graba radar_<sid>_parteN.h5 con el formato oficial de Acconeer
+# (a121.H5Recorder): los frames IQ crudos de cada medición + la configuración y la calibración
+# del detector. Se puede abrir con la Exploration Tool de Acconeer o con h5py.
+# Cada reconexión del radar abre una parte nueva. El CSV trae radar_parte y radar_frame para
+# saber qué frame del .h5 corresponde a cada fila.
+GUARDAR_CRUDO_RADAR = True
 
 
 # -----------------------------------------------------------
@@ -280,7 +288,7 @@ class Imu:
         return dict(accel=accel, euler=euler, ok=True)
 
 
-def init_radar(retries=4, contexto_guardado=None):
+def init_radar(retries=4, contexto_guardado=None, ruta_h5=None):
     print(f"Iniciando Radar XM125 por UART ({RADAR_PUERTO_SERIE})...")
     # Para limpiar el buffer antes de abrir el cliente se necesita un baudrate concreto
     baud_limpieza = RADAR_BAUDRATE or 115200
@@ -288,6 +296,7 @@ def init_radar(retries=4, contexto_guardado=None):
     for intento in range(1, retries + 1):
         s = None
         client = None
+        recorder = None
         try:
             # Limpieza previa del buffer UART
             s = serial.Serial(RADAR_PUERTO_SERIE, baudrate=baud_limpieza, timeout=0.5)
@@ -309,16 +318,29 @@ def init_radar(retries=4, contexto_guardado=None):
             detector = Detector(client=client, sensor_ids=[1], detector_config=config, context=contexto_guardado)
             time.sleep(0.3)
 
-            if config.close_range_leakage_cancellation:
-                if contexto_guardado is None:
+            # El detector SIEMPRE necesita calibrate_detector() antes de start(): sin él, start()
+            # falla con "Not ready to start (CALIBRATION_MISSING)" porque falta la calibración de
+            # offset y de ruido. Con close range además graba la calibración de fuga (~30 s y
+            # frente libre); sin close range son solo offset + ruido (unos segundos).
+            if contexto_guardado is None:
+                if config.close_range_leakage_cancellation:
                     print("  Calibrando close range inicial...")
-                    detector.calibrate_detector()
-                    # Guardamos el contexto para reutilizarlo en las reconexiones
-                    contexto_guardado = detector.context
                 else:
-                    print("  [✓] Reutilizando calibración guardada.")
+                    print("  Calibrando radar (offset + ruido, sin close range)...")
+                detector.calibrate_detector()
+                # Guardamos el contexto para reutilizarlo en las reconexiones
+                contexto_guardado = detector.context
+            else:
+                print("  [✓] Reutilizando calibración guardada.")
 
-            detector.start()
+            if ruta_h5 is not None:
+                if os.path.exists(ruta_h5):     # de un intento anterior que falló
+                    os.remove(ruta_h5)
+                recorder = a121.H5Recorder(ruta_h5)
+            detector.start(recorder=recorder)
+            detector._h5_rec = recorder      # para poder cerrarlo aunque stop() falle
+            if ruta_h5 is not None:
+                print(f"  Grabando crudo del radar en: {ruta_h5}")
             print(f"✓ OK: Radar listo [{config.start_m*100:.1f} cm - {config.end_m*100:.0f} cm] (intento {intento})")
             return client, detector, contexto_guardado
 
@@ -334,26 +356,58 @@ def init_radar(retries=4, contexto_guardado=None):
                     client.close()
             except Exception:
                 pass
+            # Si el recorder llegó a crearse, cerrar su archivo (si no, queda un .h5 vacío abierto)
+            if recorder is not None:
+                for cerrar in (getattr(recorder, "close", None),
+                               getattr(getattr(recorder, "file", None), "close", None)):
+                    try:
+                        if cerrar:
+                            cerrar()
+                            break
+                    except Exception:
+                        pass
             time.sleep(2.0)
 
     raise RuntimeError("No se pudo inicializar el radar tras varios intentos")
 
 
 def leer_radar(detector):
+    """Lee un frame del detector y devuelve TODO lo que trae el DetectorResult de Acconeer.
+    (El detector de distancia no entrega velocidad ni ángulo: ver docstring del final.)"""
+    vacio = dict(distancia_m=None, intensidad_db=None, distancias=[], intensidades=[],
+                 near_edge=None, calibracion_necesaria=None, temperatura_c=None, frame=False)
     try:
         resultado = detector.get_next()
-        distancias = resultado[1].distances
-        if distancias is not None and len(distancias) > 0:
-            return dict(distancia_m=float(distancias[0]), ok=True, desconectado=False)
-        return dict(distancia_m=None, ok=True, desconectado=False)
+        r = resultado[1]
+        distancias = [float(x) for x in r.distances] if r.distances is not None else []
+        intensidades = [float(x) for x in r.strengths] if r.strengths is not None else []
+        return dict(
+            distancia_m=distancias[0] if distancias else None,
+            intensidad_db=intensidades[0] if intensidades else None,
+            distancias=distancias, intensidades=intensidades,
+            near_edge=r.near_edge_status, calibracion_necesaria=r.calibration_needed,
+            temperatura_c=r.temperature, frame=True,
+            ok=True, desconectado=False)
     except Exception as e:
         if "No messages to consume" in str(e):
-            return dict(distancia_m=None, ok=True, desconectado=False)
+            return dict(vacio, ok=True, desconectado=False)
 
         # Cualquier otro error (como UnicodeDecodeError) rompe la sincronización:
         # marcamos 'desconectado=True' para obligar a que se reinicie el sensor.
         print(f"\n[RADAR ERROR] {type(e).__name__}: {e}", file=sys.stderr)
-        return dict(distancia_m=None, ok=False, desconectado=True)
+        return dict(vacio, ok=False, desconectado=True)
+
+
+def _num(v, fmt):
+    return format(v, fmt) if v is not None else ""
+
+
+def _lista(v, fmt):
+    return ";".join(format(x, fmt) for x in v)
+
+
+def _bool(v):
+    return "" if v is None else int(bool(v))
 
 
 def abrir_csv(sid=None):
@@ -363,6 +417,9 @@ def abrir_csv(sid=None):
     writer.writerow([
         "timestamp", "accel_x", "accel_y", "accel_z",
         "roll", "pitch", "yaw", "distancia_m", "imu_ok", "radar_ok",
+        # --- todo lo demás que entrega el detector de distancia ---
+        "intensidad_db", "n_picos", "distancias_m", "intensidades_db",
+        "near_edge", "calibracion_necesaria", "temperatura_c", "radar_parte", "radar_frame",
     ])
     print(f"Guardando respaldo local en: {nombre}")
     return f, writer
@@ -591,6 +648,27 @@ def esperar_pico_fin(receptor):
     return receptor.ev_fin.is_set()
 
 
+def cerrar_h5(detector):
+    """Cierra el .h5 del radar. detector.stop() lo cierra solo si stop_session() anda, pero
+    cuando el UART perdió sincronía stop() falla ANTES de cerrar el archivo y el .h5 queda
+    corrupto (no se puede abrir). Esto lo cierra igual: primero lo ordenado, si no, el archivo."""
+    rec = getattr(detector, "_h5_rec", None) if detector is not None else None
+    if rec is None:
+        return
+    detector._h5_rec = None
+    try:
+        if getattr(rec, "file", None) is not None and rec.file.id.valid:   # sigue abierto
+            try:
+                rec.close()
+            except Exception:
+                try:
+                    rec.file.close()
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
+
 def liberar(detector, client, imu_dev, csv_file):
     """Cierra radar, IMU y CSV (se puede llamar más de una vez)."""
     if csv_file is not None:
@@ -599,12 +677,17 @@ def liberar(detector, client, imu_dev, csv_file):
             csv_file.close()
         except Exception:
             pass
-    for obj, metodo in ((detector, "stop"), (client, "close")):
-        if obj is not None:
-            try:
-                getattr(obj, metodo)()
-            except Exception:
-                pass
+    if detector is not None:
+        try:
+            detector.stop()
+        except Exception:
+            pass
+        cerrar_h5(detector)
+    if client is not None:
+        try:
+            client.close()
+        except Exception:
+            pass
     if imu_dev is not None:
         try:
             imu_dev.i2c.deinit()
@@ -664,6 +747,11 @@ def sesion(ctl, receptor, live, resp_on):
     imu_dev = client = detector = csv_file = None
     contador = 0
     reconexiones_radar = 0
+    radar_parte = 1          # cada reconexión del radar = un .h5 nuevo
+    radar_frame = 0          # frames leídos en la parte actual (índice dentro del .h5)
+
+    def ruta_h5(parte):
+        return f"radar_{sid}_parte{parte}.h5" if GUARDAR_CRUDO_RADAR else None
     resp_off = None
     t0 = None
     error = None
@@ -682,7 +770,8 @@ def sesion(ctl, receptor, live, resp_on):
         imu_dev = Imu(crear_reset_imu())
         time.sleep(1.0)
         contexto = None if RECALIBRAR_CADA_ON else ctl.contexto_radar
-        client, detector, contexto_radar = init_radar(contexto_guardado=contexto)
+        client, detector, contexto_radar = init_radar(contexto_guardado=contexto,
+                                                      ruta_h5=ruta_h5(radar_parte))
         ctl.contexto_radar = contexto_radar
         csv_file, csv_writer = abrir_csv(sid)
 
@@ -736,6 +825,9 @@ def sesion(ctl, receptor, live, resp_on):
                 t_b = time.perf_counter()
                 radar = leer_radar(detector)
                 t_c = time.perf_counter()
+                parte_fila, frame_fila = radar_parte, (radar_frame if radar["frame"] else None)
+                if radar["frame"]:
+                    radar_frame += 1
 
                 # PROTECCIÓN ANTI-IMU: si la IMU tardó más de 1.5 s (porque se reinició),
                 # es casi seguro que el buffer UART del radar se llenó de basura y perdió sincronía.
@@ -751,12 +843,16 @@ def sesion(ctl, receptor, live, resp_on):
                         detector.stop()
                     except Exception:
                         pass
+                    cerrar_h5(detector)      # que la parte que termina quede legible
                     try:
                         client.close()
                     except Exception:
                         pass
                     try:
-                        client, detector, contexto_radar = init_radar(contexto_guardado=contexto_radar)
+                        radar_parte += 1
+                        radar_frame = 0
+                        client, detector, contexto_radar = init_radar(contexto_guardado=contexto_radar,
+                                                                      ruta_h5=ruta_h5(radar_parte))
                         print("[RADAR] Reconectado con éxito", file=sys.stderr)
                     except Exception as e:
                         print(f"[RADAR] Falló la reconexión: {e}", file=sys.stderr)
@@ -778,6 +874,11 @@ def sesion(ctl, receptor, live, resp_on):
                     roll=roll, pitch=pitch, yaw=yaw,
                     distancia_m=dist_m,
                     imu_ok=imu["ok"], radar_ok=radar["ok"],
+                    intensidad_db=radar["intensidad_db"],
+                    distancias_m=radar["distancias"], intensidades_db=radar["intensidades"],
+                    near_edge=radar["near_edge"], calibracion_necesaria=radar["calibracion_necesaria"],
+                    temperatura_c=radar["temperatura_c"],
+                    radar_parte=parte_fila, radar_frame=frame_fila,
                     # --- NUEVO: Enviar datos de la Pico a la PC ---
                     pico_roll=pico_roll,
                     pico_pitch=pico_pitch,
@@ -809,6 +910,10 @@ def sesion(ctl, receptor, live, resp_on):
                         f"{muestra['roll']:.3f}", f"{muestra['pitch']:.3f}", f"{muestra['yaw']:.3f}",
                         f"{muestra['distancia_m']:.4f}" if muestra['distancia_m'] is not None else "",
                         int(muestra['imu_ok']), int(muestra['radar_ok']),
+                        _num(radar["intensidad_db"], ".2f"), len(radar["distancias"]),
+                        _lista(radar["distancias"], ".4f"), _lista(radar["intensidades"], ".2f"),
+                        _bool(radar["near_edge"]), _bool(radar["calibracion_necesaria"]),
+                        _num(radar["temperatura_c"], "d"), parte_fila, _num(frame_fila, "d"),
                     ])
 
                     contador += 1

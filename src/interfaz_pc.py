@@ -2,21 +2,21 @@ import sys
 import json
 import socket
 import math
+import queue
 import numpy as np
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QPushButton, QLineEdit, QLabel, QTextEdit, QFrame)
 from PyQt5.QtGui import QPixmap, QFont
-from PyQt5.QtCore import QThread, pyqtSignal, Qt
+from PyQt5.QtCore import QThread, pyqtSignal, Qt, QTimer
 import pyqtgraph as pg
 
 # --- Hilos de Comunicación ---
 
 class DatosLiveThread(QThread):
-    datos_recibidos = pyqtSignal(dict)
-    
-    def __init__(self, ip):
+    def __init__(self, ip, cola_datos):
         super().__init__()
         self.ip = ip
+        self.cola_datos = cola_datos
         self.corriendo = True
         
     def run(self):
@@ -30,7 +30,8 @@ class DatosLiveThread(QThread):
                             break
                         try:
                             datos = json.loads(linea)
-                            self.datos_recibidos.emit(datos)
+                            # Guardamos en la cola en lugar de emitir una señal que sature la UI
+                            self.cola_datos.put(datos)
                         except json.JSONDecodeError:
                             pass
             except OSError:
@@ -51,7 +52,7 @@ class ControlThread(QThread):
         try:
             self.log_recibido.emit(f"\n[*] Comando '{self.comando.upper()}' enviado a {self.ip}...")
             s = socket.create_connection((self.ip, 5004), timeout=10)
-            s.settimeout(300.0)  # Tiempo de espera largo para no trancar al unir CSVs
+            s.settimeout(300.0) 
             s.sendall((self.comando.upper() + "\n").encode())
             f = s.makefile("rb")
             
@@ -62,7 +63,6 @@ class ControlThread(QThread):
                 texto = linea.decode(errors="replace").rstrip("\n")
                 palabra = texto.split(" ", 1)[0]
                 
-                # Auto-descarga del archivo CSV
                 if palabra == "CSV":
                     _, n_bytes, nombre = texto.split(" ", 2)
                     n_bytes = int(n_bytes)
@@ -101,10 +101,11 @@ class InterfazPies(QMainWindow):
             QTextEdit { background-color: #020617; color: #34d399; font-family: Consolas, monospace; border: 1px solid #334155; border-radius: 6px; padding: 12px; font-size: 14px;}
         """)
         
-        pg.setConfigOptions(antialias=True)
         pg.setConfigOption('background', '#1e293b')
         pg.setConfigOption('foreground', '#f8fafc')
         
+        # Estructuras de datos
+        self.cola_datos = queue.Queue()
         self.max_pts = 100
         self.data_dist = np.zeros(self.max_pts)
         self.data_m_roll = np.zeros(self.max_pts)
@@ -113,6 +114,12 @@ class InterfazPies(QMainWindow):
         self.data_p_pitch = np.zeros(self.max_pts)
         
         self.hilo_datos = None
+        
+        # Temporizador para actualizar la interfaz a ~30 FPS fijos
+        self.timer_graficos = QTimer()
+        self.timer_graficos.timeout.connect(self.procesar_graficas)
+        self.timer_graficos.start(33) # 33 milisegundos
+        
         self.init_ui()
 
     def envolver_grafico(self, titulo, grafico):
@@ -169,15 +176,17 @@ class InterfazPies(QMainWindow):
         control_layout.addWidget(self.btn_start)
         control_layout.addWidget(self.btn_stop)
         
-        # Manejo seguro del Logo
         lbl_logo = QLabel()
         lbl_logo.setStyleSheet("border: none;")
+        lbl_logo.setAlignment(Qt.AlignRight | Qt.AlignVCenter) # Lo alinea a la derecha para que no quede flotando
+        
         pixmap = QPixmap("ucu-3.png")
         if not pixmap.isNull():
-            lbl_logo.setPixmap(pixmap.scaledToHeight(55, Qt.SmoothTransformation))
+            # Aumentamos la altura a 85 para que se lea perfecto
+            lbl_logo.setPixmap(pixmap.scaledToHeight(85, Qt.SmoothTransformation))
         else:
             lbl_logo.setText("UCU")
-            lbl_logo.setFont(QFont("Segoe UI", 14, QFont.Bold))
+            lbl_logo.setFont(QFont("Segoe UI", 18, QFont.Bold))
             lbl_logo.setStyleSheet("color: #94a3b8; border: none;")
             
         control_layout.addStretch()
@@ -200,11 +209,10 @@ class InterfazPies(QMainWindow):
         
         left_panel.addWidget(self.envolver_grafico("Cinemática de Piernas (Pitch)", self.plot_piernas), stretch=3)
         
-        # Distancia (AHORA SOLO PUNTOS)
+        # Distancia (Puntos)
         self.plot_dist = pg.PlotWidget()
         self.configurar_ejes(self.plot_dist)
         self.plot_dist.showGrid(x=True, y=True, alpha=0.2)
-        # pen=None quita la línea. symbol='o' dibuja un círculo por cada medida.
         self.curva_dist = self.plot_dist.plot(pen=None, symbol='o', symbolSize=8, symbolBrush='#f59e0b', symbolPen='#d97706')
         
         left_panel.addWidget(self.envolver_grafico("Radar de Distancia (Metros)", self.plot_dist), stretch=2)
@@ -255,9 +263,12 @@ class InterfazPies(QMainWindow):
         self.hilo_control.log_recibido.connect(self.registrar_log)
         self.hilo_control.start()
         
+        # Limpiar cola de datos anterior
+        while not self.cola_datos.empty():
+            self.cola_datos.get()
+            
         if self.hilo_datos is None or not self.hilo_datos.corriendo:
-            self.hilo_datos = DatosLiveThread(ip)
-            self.hilo_datos.datos_recibidos.connect(self.actualizar_graficas)
+            self.hilo_datos = DatosLiveThread(ip, self.cola_datos)
             self.hilo_datos.start()
             
     def detener_medicion(self):
@@ -270,37 +281,45 @@ class InterfazPies(QMainWindow):
             self.hilo_datos.stop()
             self.hilo_datos = None
             
-    def actualizar_graficas(self, datos):
-        self.data_dist[:-1] = self.data_dist[1:]
-        self.data_m_roll[:-1] = self.data_m_roll[1:]
-        self.data_m_pitch[:-1] = self.data_m_pitch[1:]
-        self.data_p_roll[:-1] = self.data_p_roll[1:]
-        self.data_p_pitch[:-1] = self.data_p_pitch[1:]
-        
-        dist = datos.get("distancia_m")
-        self.data_dist[-1] = dist if dist is not None else 0.0
-        
-        m_roll, m_pitch = datos.get("roll", 0), datos.get("pitch", 0)
-        p_roll, p_pitch = datos.get("pico_roll", 0), datos.get("pico_pitch", 0)
-        
-        self.data_m_roll[-1] = m_roll
-        self.data_m_pitch[-1] = m_pitch
-        self.data_p_roll[-1] = p_roll
-        self.data_p_pitch[-1] = p_pitch
-        
-        self.curva_dist.setData(self.data_dist)
-        self.curva_m_roll.setData(self.data_m_roll)
-        self.curva_m_pitch.setData(self.data_m_pitch)
-        self.curva_p_roll.setData(self.data_p_roll)
-        self.curva_p_pitch.setData(self.data_p_pitch)
-        
-        rad_m = math.radians(m_pitch)
-        x1, y1 = math.sin(rad_m), -math.cos(rad_m)
-        self.linea_pierna1.setData([0, x1], [0, y1])
-        
-        rad_p = math.radians(p_pitch)
-        x2, y2 = math.sin(rad_p), -math.cos(rad_p)
-        self.linea_pierna2.setData([0, x2], [0, y2])
+    def procesar_graficas(self):
+        """Vacia la cola de datos acumulados y renderiza los gráficos UNA SOLA VEZ por fotograma"""
+        if self.cola_datos.empty():
+            return
+            
+        ultimo_dato = None
+        # Sacar TODOS los datos que llegaron desde el último fotograma
+        while not self.cola_datos.empty():
+            ultimo_dato = self.cola_datos.get()
+            
+            self.data_dist[:-1] = self.data_dist[1:]
+            self.data_m_roll[:-1] = self.data_m_roll[1:]
+            self.data_m_pitch[:-1] = self.data_m_pitch[1:]
+            self.data_p_roll[:-1] = self.data_p_roll[1:]
+            self.data_p_pitch[:-1] = self.data_p_pitch[1:]
+            
+            dist = ultimo_dato.get("distancia_m")
+            self.data_dist[-1] = dist if dist is not None else 0.0
+            
+            self.data_m_roll[-1] = ultimo_dato.get("roll", 0)
+            self.data_m_pitch[-1] = ultimo_dato.get("pitch", 0)
+            self.data_p_roll[-1] = ultimo_dato.get("pico_roll", 0)
+            self.data_p_pitch[-1] = ultimo_dato.get("pico_pitch", 0)
+
+        # Solo actualizamos el dibujo en pantalla una vez procesada toda la cola
+        if ultimo_dato:
+            self.curva_dist.setData(self.data_dist)
+            self.curva_m_roll.setData(self.data_m_roll)
+            self.curva_m_pitch.setData(self.data_m_pitch)
+            self.curva_p_roll.setData(self.data_p_roll)
+            self.curva_p_pitch.setData(self.data_p_pitch)
+            
+            rad_m = math.radians(self.data_m_pitch[-1])
+            x1, y1 = math.sin(rad_m), -math.cos(rad_m)
+            self.linea_pierna1.setData([0, x1], [0, y1])
+            
+            rad_p = math.radians(self.data_p_pitch[-1])
+            x2, y2 = math.sin(rad_p), -math.cos(rad_p)
+            self.linea_pierna2.setData([0, x2], [0, y2])
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)

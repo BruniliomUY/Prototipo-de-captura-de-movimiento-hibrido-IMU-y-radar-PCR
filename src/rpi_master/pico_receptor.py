@@ -1,3 +1,5 @@
+#PICO_RECEPTOR
+
 #!/usr/bin/env python3
 """
 Corre en la Raspberry Pi Zero (master), en un hilo aparte dentro de master.py.
@@ -51,6 +53,12 @@ VENTANA_SYNC = 400          # muestras para estimar el offset de reloj (~20 s a 
 TIMEOUT_SIN_DATOS_S = 5.0   # sin datos este tiempo => se da la conexión por muerta
                             # (si la Pico se queda sin batería el TCP no se cierra solo)
 ACK_S = 0.25                # cada cuánto confirmarle a la Pico lo recibido
+
+# Baliza: la master avisa por UDP "MASTER <puerto>" cada BALIZA_CADA_S. La Pico y controlar.py
+# toman la IP de quien manda el aviso, así no hay que escribir ninguna IP a mano.
+BALIZA_PUERTO = 5007
+BALIZA_CADA_S = 2.0
+BALIZA_DESTINOS = None      # None = broadcast general + broadcast de la subred (/24)
 
 COLUMNAS = [
     "ts_master_est", "t_recepcion", "t_pico_ms", "seq", "boot_id",
@@ -151,6 +159,40 @@ class ReceptorPico(threading.Thread):
                 pass
         self._f = None
         self._w = None
+
+    # ---------------------------------------------------------------
+    def start(self):
+        super().start()
+        threading.Thread(target=self._emitir_baliza, name="Baliza", daemon=True).start()
+
+    @staticmethod
+    def _destinos_baliza():
+        if BALIZA_DESTINOS is not None:
+            return list(BALIZA_DESTINOS)
+        destinos = ["255.255.255.255"]
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect(("10.255.255.255", 1))     # no envía nada: solo averigua la IP propia
+            a, b, c, _ = s.getsockname()[0].split(".")
+            destinos.append(f"{a}.{b}.{c}.255")
+        except Exception:
+            pass
+        finally:
+            s.close()
+        return destinos
+
+    def _emitir_baliza(self):
+        u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        u.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        mensaje = f"MASTER {self.port}".encode()
+        while not self._detener.is_set():
+            for destino in self._destinos_baliza():
+                try:
+                    u.sendto(mensaje, (destino, BALIZA_PUERTO))
+                except OSError:
+                    pass        # sin red todavía, o ese destino no existe: se reintenta
+            self._detener.wait(BALIZA_CADA_S)
+        u.close()
 
     # ---------------------------------------------------------------
     def detener(self):

@@ -26,6 +26,20 @@ IMU_ERRORES_MAX = 3         # errores seguidos (que no sean OSError) antes de re
 IMU_CONGELADO_MS = 5000     # accel + cuaternión idénticos este tiempo => IMU congelado
 REINTENTO_INIT_MS = 2000    # si el sensor no arranca, cada cuánto reintentar
 
+# --- IMU simulada (config.IMU = "sim"): una sinusoide constante, sin ruido ni saltos ---
+#   canal(t) = centro + amplitud * sin(2*pi*SIM_HZ*t + fase)
+# Todos los canales usan la misma frecuencia; cambian la amplitud y la fase para poder
+# distinguirlos en un gráfico. Con SIM_HZ = 1 y 20 muestras/s hay 20 puntos por ciclo.
+SIM_HZ = 1.0                # ciclos por segundo
+SIM_CANALES = {             # (centro, amplitud, fase en grados)
+    "accel_x": (0.0, 2.0, 0),      # m/s²
+    "accel_y": (0.0, 2.0, 90),
+    "accel_z": (9.81, 2.0, 0),
+    "roll": (0.0, 30.0, 0),        # grados
+    "pitch": (0.0, 15.0, 90),
+    "yaw": (0.0, 45.0, 0),
+}
+
 
 def ms():
     return time.monotonic_ns() // 1_000_000
@@ -146,20 +160,27 @@ class ImuBno085:
 
 
 class ImuSimulada:
-    """Señales tipo caminata (~1.8 pasos/s) para probar red, buffer y CSV sin sensor."""
+    """Sinusoide constante (ver SIM_HZ y SIM_CANALES) para probar red, buffer, sincronización
+    y CSV sin sensor. Siempre imu_ok=1."""
 
     TIPO = "sim"
     reinicios = 0
 
     def __init__(self):
         self.t0 = ms()
+        # El ángulo se calcula con enteros (ms dentro del ciclo): los float de CircuitPython son
+        # de 32 bits y 2*pi*f*t pierde precisión con las horas de uso.
+        self.periodo_ms = max(1, int(round(1000.0 / SIM_HZ)))
+
+    def _canal(self, nombre, ang):
+        centro, amplitud, fase = SIM_CANALES[nombre]
+        return centro + amplitud * math.sin(ang + math.radians(fase))
 
     def leer(self):
-        t = (ms() - self.t0) / 1000.0
-        paso = 2 * math.pi * 1.8 * t
+        ang = 2 * math.pi * ((ms() - self.t0) % self.periodo_ms) / self.periodo_ms
         return _muestra(
-            (1.5 * math.sin(paso), 0.5 * math.sin(paso / 2), 9.81 + 2.0 * math.sin(paso)),
-            (3.0 * math.sin(paso / 2), 5.0 * math.sin(paso), (t * 2.0) % 360.0 - 180.0),
+            (self._canal("accel_x", ang), self._canal("accel_y", ang), self._canal("accel_z", ang)),
+            (self._canal("roll", ang), self._canal("pitch", ang), self._canal("yaw", ang)),
             True,
         )
 
