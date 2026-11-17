@@ -32,7 +32,7 @@ BUFFER_MAX = 200
 IMU = "bno085"
 
 # BNO085 por I2C. Pines de la Pico W: GP4 = pin 6 (SDA), GP5 = pin 7 (SCL), 3V3 = pin 36.
-I2C_SDA = "GP28"
+I2C_SDA = "GP26"
 I2C_SCL = "GP27"
 I2C_FREQ = 400_000
 BNO_ADDR = 0x4A             # 0x4B si el breakout tiene el jumper DI/ADR puenteado
